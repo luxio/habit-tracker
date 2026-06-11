@@ -1,6 +1,19 @@
-# Welcome to your Expo app 👋
+# Habit Tracker
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A small, polished habit-tracking app built with [Expo](https://expo.dev) (SDK 56, React Native 0.85, React 19) and Expo Router. Track daily habits, build streaks, take on consistency challenges, and get a little reward feedback every time you check one off.
+
+> Demo project for *How to Build Mobile Apps with Claude Code*.
+
+## Features
+
+- **Today** — toggle habit completion, add/delete habits, see a daily progress ring. Habits can have a per-day target (e.g. drink water 8×).
+- **Progress** — last-7-days grid plus current/longest streak and completion-rate stats.
+- **Challenges** — start a multi-day "all habits complete" challenge and claim a reward when you finish it.
+- **Habit detail** — per-habit history, streaks, and target editing (`/habit/[id]`).
+- **Onboarding** — first-run intro flow.
+- **Reward feedback** — haptics + a chime + confetti the moment a habit or challenge is completed.
+- **Local reminders** — twice-daily local notifications (works in Expo Go on iOS).
+- **Light/dark theming** and a **web** build via React Native Web.
 
 ## Get started
 
@@ -13,44 +26,58 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 2. Start the app
 
    ```bash
-   npx expo start
+   npm start          # Metro dev server (i=iOS, a=Android, w=web, r=reload)
+   npm run ios        # start + open iOS simulator
+   npm run web        # start + open in the browser
    ```
 
-In the output, you'll find options to open the app in a
+AsyncStorage is bundled into Expo Go, so the app runs there without a custom dev build.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+> **Platform note:** the iOS simulator works out of the box (Xcode required). Android is not configured locally (needs JDK 17+ / Android Studio) — use Expo Go or EAS for Android.
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Scripts
 
 ```bash
-npm run reset-project
+npm start              # Metro dev server
+npm run ios            # open iOS simulator
+npm run web            # open web build
+npx tsc --noEmit       # type-check — the primary correctness gate (no test suite)
+npm run lint           # ESLint (expo lint)
+npx expo-doctor        # validate project/native config
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Project structure
 
-### Other setup steps
+Source lives in **`src/`**. Path aliases: `@/*` → `src/*`, `@/assets/*` → `assets/*`.
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```
+src/
+  app/                     # Expo Router routes (route root is src/app)
+    _layout.tsx            # ThemeProvider → HabitsProvider → tabs
+    (tabs)/
+      index.tsx            # Today
+      explore.tsx          # Progress
+      challenges.tsx       # Challenges
+    habit/[id].tsx         # Habit detail
+    onboarding.tsx         # First-run intro
+  components/              # ThemedText / ThemedView, app tabs, celebration, ui/…
+  constants/theme.ts       # Colors, Spacing, Fonts, layout constants
+  hooks/                   # useTheme, color scheme
+  lib/
+    habits-store.tsx       # HabitsProvider + useHabits() — single source of truth
+    habit.ts               # pure helpers (counts, completion, consistency)
+    date.ts                # local-time date keys + streak/grid helpers
+    feedback.ts            # haptics + chime reward feedback
+    notifications.ts       # twice-daily local reminders
+```
 
-## Learn more
+### How it fits together
 
-To learn more about developing your project with Expo, look at the following resources:
+- **State:** `HabitsProvider` (`src/lib/habits-store.tsx`) is the single source of truth. It persists the whole habit array to AsyncStorage (key `habits.v1`) on every change and seeds default habits on first load. A `Habit.history` is a `Record<'YYYY-MM-DD', number>` of per-day completion counts; a day is complete once the count reaches the habit's `target`.
+- **Navigation:** the app uses `NativeTabs` (`expo-router/unstable-native-tabs`) wired up in `src/components/app-tabs.tsx`, not Expo Router's `<Tabs>`. To add a screen, add the route file under `src/app/` and a `NativeTabs.Trigger` in `app-tabs.tsx`.
+- **Styling:** go through theme primitives — `ThemedText` / `ThemedView` and the `Colors`/`Spacing` scales in `src/constants/theme.ts` — rather than raw `Text`/`View`.
+- **Web vs native:** some components ship a `*.web.tsx` variant (e.g. `app-tabs`, `animated-icon`); Metro picks the platform variant automatically.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Notes
 
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+There is no test framework configured — `npx tsc --noEmit` (TypeScript strict) is the primary correctness gate. Expo SDK 56 changed many APIs; check the [versioned docs](https://docs.expo.dev/versions/v56.0.0/) before adding native features.
