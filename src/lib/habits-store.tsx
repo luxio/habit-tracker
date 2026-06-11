@@ -1,48 +1,33 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   createContext,
   useCallback,
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from 'react';
 
+import { useAuth } from '@/lib/auth';
 import { addDaysKey, daysSince, todayKey } from '@/lib/date';
-import { allComplete, isComplete } from '@/lib/habit';
+import { allComplete } from '@/lib/habit';
+import * as api from '@/lib/habits-api';
 import { cancelReminders } from '@/lib/notifications';
+import {
+  mutationKeys,
+  queryClient,
+  queryKeys,
+  type ChallengeStartVars,
+  type HabitAddVars,
+  type HabitSetLogVars,
+} from '@/lib/query-client';
+import type { Challenge, ChallengeStatus, Habit, HabitType } from '@/lib/types';
 
-export type HabitType = 'binary' | 'volume';
+// Re-exported so existing screens keep importing these from '@/lib/habits-store'.
+export type { Challenge, ChallengeStatus, Habit, HabitType };
 
-export type Habit = {
-  id: string;
-  name: string;
-  emoji: string;
-  color: string;
-  /** 'binary' = once/day; 'volume' = target times/day. */
-  type: HabitType;
-  /** Completions needed per day (binary = 1). */
-  target: number;
-  /** Map of 'YYYY-MM-DD' -> times logged that day. */
-  history: Record<string, number>;
-};
-
-export type Challenge = {
-  id: string;
-  title: string;
-  lengthDays: number;
-  /** Day the challenge began. */
-  startKey: string;
-  rewardClaimed: boolean;
-};
-
-export type ChallengeStatus = 'active' | 'completed' | 'failed';
-
-const STORAGE_KEY = 'habits.v2';
-const LEGACY_KEY = 'habits.v1';
-const CHALLENGE_KEY = 'challenge.v1';
 const REMINDERS_KEY = 'reminders.v1';
 const ONBOARDING_KEY = 'onboarding.v1';
 
@@ -50,29 +35,8 @@ const ONBOARDING_KEY = 'onboarding.v1';
 export const HABIT_COLORS = ['#3c87f7', '#34c759', '#ff9500', '#ff2d55', '#af52de', '#5ac8fa'];
 export const SUGGESTED_EMOJI = ['💧', '🏃', '📚', '🧘', '🥗', '😴', '✍️', '🎸', '🧹', '☎️'];
 
-function seedHabits(): Habit[] {
-  return [
-    { id: 'h1', name: 'Drink water', emoji: '💧', color: '#3c87f7', type: 'volume', target: 8, history: {} },
-    { id: 'h2', name: 'Move 20 min', emoji: '🏃', color: '#34c759', type: 'binary', target: 1, history: {} },
-    { id: 'h3', name: 'Read', emoji: '📚', color: '#ff9500', type: 'binary', target: 1, history: {} },
-  ];
-}
-
-/** Old (v1) habits stored history as Record<string, boolean>. */
-type LegacyHabit = {
-  id: string;
-  name: string;
-  emoji: string;
-  color: string;
-  history: Record<string, boolean>;
-};
-
-function migrateLegacy(legacy: LegacyHabit[]): Habit[] {
-  return legacy.map((h) => {
-    const history: Record<string, number> = {};
-    for (const [key, done] of Object.entries(h.history)) if (done) history[key] = 1;
-    return { ...h, type: 'binary' as const, target: 1, history };
-  });
+function tempId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /** Derived progress/status for a challenge against current habits. */
@@ -117,156 +81,277 @@ type HabitsContextValue = {
   clearChallenge: () => void;
   setRemindersEnabled: (enabled: boolean) => void;
   completeOnboarding: () => void;
-  /** Wipe all persisted data and return to a fresh-install state. */
+  /** Wipe all data (server + local prefs) and restore the default habits. */
   resetAll: () => void;
 };
 
 const HabitsContext = createContext<HabitsContextValue | null>(null);
 
 export function HabitsProvider({ children }: { children: ReactNode }) {
-  const [habits, setHabits] = useState<Habit[]>([]);
-  const [activeChallenge, setActiveChallenge] = useState<Challenge | null>(null);
+  const { user } = useAuth();
+  const userId = user?.id;
+  const enabled = !!userId;
+
+  // ---- Device-local prefs (not user data; stay in AsyncStorage) ----
   const [remindersEnabled, setRemindersEnabledState] = useState(false);
   const [onboardingDone, setOnboardingDone] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [prefsLoading, setPrefsLoading] = useState(true);
 
-  // Keep a ref to current habits so imperative callbacks read fresh state.
-  const habitsRef = useRef(habits);
-  useEffect(() => {
-    habitsRef.current = habits;
-  }, [habits]);
-
-  // Load once on mount (with v1 -> v2 migration).
   useEffect(() => {
     (async () => {
       try {
-        const [raw, legacyRaw, challengeRaw, remindersRaw, onboardingRaw] = await Promise.all([
-          AsyncStorage.getItem(STORAGE_KEY),
-          AsyncStorage.getItem(LEGACY_KEY),
-          AsyncStorage.getItem(CHALLENGE_KEY),
+        const [remindersRaw, onboardingRaw] = await Promise.all([
           AsyncStorage.getItem(REMINDERS_KEY),
           AsyncStorage.getItem(ONBOARDING_KEY),
         ]);
-
-        if (raw) {
-          setHabits(JSON.parse(raw) as Habit[]);
-        } else if (legacyRaw) {
-          setHabits(migrateLegacy(JSON.parse(legacyRaw) as LegacyHabit[]));
-        } else {
-          setHabits(seedHabits());
-        }
-
-        if (challengeRaw) setActiveChallenge(JSON.parse(challengeRaw) as Challenge);
         setRemindersEnabledState(remindersRaw === 'true');
         setOnboardingDone(onboardingRaw === 'true');
-      } catch {
-        setHabits(seedHabits());
       } finally {
-        setLoading(false);
+        setPrefsLoading(false);
       }
     })();
   }, []);
 
-  // Persist habits on change (after initial load).
-  useEffect(() => {
-    if (!loading) AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(habits)).catch(() => {});
-  }, [habits, loading]);
+  // ---- Server state (habits + challenge) via TanStack Query ----
+  const habitsKey = queryKeys.habits(userId ?? 'anon');
+  const challengeKey = queryKeys.challenge(userId ?? 'anon');
 
-  // Persist the active challenge (or clear it).
-  useEffect(() => {
-    if (loading) return;
-    if (activeChallenge) {
-      AsyncStorage.setItem(CHALLENGE_KEY, JSON.stringify(activeChallenge)).catch(() => {});
-    } else {
-      AsyncStorage.removeItem(CHALLENGE_KEY).catch(() => {});
-    }
-  }, [activeChallenge, loading]);
+  const habitsQuery = useQuery({
+    queryKey: habitsKey,
+    queryFn: api.fetchHabits,
+    enabled,
+  });
+  const challengeQuery = useQuery({
+    queryKey: challengeKey,
+    queryFn: api.fetchChallenge,
+    enabled,
+  });
 
-  const logHabit = useCallback((id: string) => {
-    const key = todayKey();
-    const habit = habitsRef.current.find((h) => h.id === id);
-    let justCompleted = false;
-    if (habit) {
-      const before = isComplete(habit, key);
-      const next = Math.min(habit.target, (habit.history[key] ?? 0) + 1);
-      justCompleted = !before && next >= habit.target;
-    }
-    setHabits((prev) =>
-      prev.map((h) => {
-        if (h.id !== id) return h;
-        const count = h.history[key] ?? 0;
-        if (count >= h.target) return h; // already at target
-        return { ...h, history: { ...h.history, [key]: count + 1 } };
-      })
-    );
-    return { justCompleted };
-  }, []);
+  const habits = useMemo(() => habitsQuery.data ?? [], [habitsQuery.data]);
+  const activeChallenge = challengeQuery.data ?? null;
 
-  const unlogHabit = useCallback((id: string) => {
-    const key = todayKey();
-    setHabits((prev) =>
-      prev.map((h) => {
-        if (h.id !== id) return h;
-        const count = h.history[key] ?? 0;
-        if (count <= 0) return h;
-        const history = { ...h.history };
-        const next = count - 1;
-        if (next <= 0) delete history[key];
-        else history[key] = next;
-        return { ...h, history };
-      })
-    );
-  }, []);
+  const getHabits = useCallback(
+    () => queryClient.getQueryData<Habit[]>(habitsKey) ?? [],
+    [habitsKey]
+  );
+  const setHabitsData = useCallback(
+    (updater: (prev: Habit[]) => Habit[]) => {
+      queryClient.setQueryData<Habit[]>(habitsKey, (prev) => updater(prev ?? []));
+    },
+    [habitsKey]
+  );
 
-  const addHabit = useCallback<HabitsContextValue['addHabit']>((name, opts) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setHabits((prev) => {
-      const type = opts?.type ?? 'binary';
-      const habit: Habit = {
-        id: `h${Date.now()}`,
-        name: trimmed,
-        emoji: opts?.emoji ?? SUGGESTED_EMOJI[prev.length % SUGGESTED_EMOJI.length],
-        color: opts?.color ?? HABIT_COLORS[prev.length % HABIT_COLORS.length],
-        type,
-        target: type === 'binary' ? 1 : Math.max(2, opts?.target ?? 3),
+  // ---- Habit mutations (optimistic; mutationFn comes from setMutationDefaults) ----
+
+  const setLogMutation = useMutation<unknown, Error, HabitSetLogVars, { prev: Habit[] }>({
+    mutationKey: mutationKeys.habitSetLog,
+    onMutate: async ({ habitId, day, count }) => {
+      await queryClient.cancelQueries({ queryKey: habitsKey });
+      const prev = getHabits();
+      setHabitsData((habits) =>
+        habits.map((h) => {
+          if (h.id !== habitId) return h;
+          const history = { ...h.history };
+          if (count <= 0) delete history[day];
+          else history[day] = count;
+          return { ...h, history };
+        })
+      );
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(habitsKey, ctx.prev);
+    },
+    // No onSettled refetch: avoids flicker during rapid toggling. The optimistic
+    // value matches what we wrote; fetchHabits reconciles on the next load.
+  });
+
+  const addMutation = useMutation<unknown, Error, HabitAddVars, { prev: Habit[] }>({
+    mutationKey: mutationKeys.habitAdd,
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey: habitsKey });
+      const prev = getHabits();
+      const optimistic: Habit = {
+        id: vars.tempId,
+        name: vars.name,
+        emoji: vars.emoji,
+        color: vars.color,
+        type: vars.type,
+        target: vars.target,
         history: {},
       };
-      return [...prev, habit];
-    });
-  }, []);
+      setHabitsData((habits) => [...habits, optimistic]);
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(habitsKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: habitsKey }),
+  });
 
-  const deleteHabit = useCallback((id: string) => {
-    setHabits((prev) => prev.filter((h) => h.id !== id));
-  }, []);
+  const deleteMutation = useMutation<unknown, Error, { id: string }, { prev: Habit[] }>({
+    mutationKey: mutationKeys.habitDelete,
+    onMutate: async ({ id }) => {
+      await queryClient.cancelQueries({ queryKey: habitsKey });
+      const prev = getHabits();
+      setHabitsData((habits) => habits.filter((h) => h.id !== id));
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(habitsKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: habitsKey }),
+  });
 
-  const setHabitTarget = useCallback((id: string, target: number) => {
-    setHabits((prev) =>
-      prev.map((h) =>
-        h.id === id ? { ...h, target: h.type === 'binary' ? 1 : Math.max(2, target) } : h
-      )
-    );
-  }, []);
+  const targetMutation = useMutation<unknown, Error, { id: string; target: number }, { prev: Habit[] }>({
+    mutationKey: mutationKeys.habitSetTarget,
+    onMutate: async ({ id, target }) => {
+      await queryClient.cancelQueries({ queryKey: habitsKey });
+      const prev = getHabits();
+      setHabitsData((habits) => habits.map((h) => (h.id === id ? { ...h, target } : h)));
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(habitsKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: habitsKey }),
+  });
 
-  const startChallenge = useCallback((lengthDays: number) => {
-    setActiveChallenge({
-      id: `c${Date.now()}`,
-      title: `${lengthDays}-Day Starter`,
-      lengthDays,
-      startKey: todayKey(),
-      rewardClaimed: false,
-    });
-  }, []);
+  // ---- Challenge mutations ----
+
+  const startChallengeMutation = useMutation<unknown, Error, ChallengeStartVars, { prev: Challenge | null }>({
+    mutationKey: mutationKeys.challengeStart,
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey: challengeKey });
+      const prev = queryClient.getQueryData<Challenge | null>(challengeKey) ?? null;
+      const optimistic: Challenge = {
+        id: tempId('c'),
+        title: vars.title,
+        lengthDays: vars.lengthDays,
+        startKey: vars.startKey,
+        rewardClaimed: false,
+      };
+      queryClient.setQueryData<Challenge | null>(challengeKey, optimistic);
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(challengeKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: challengeKey }),
+  });
+
+  const claimChallengeMutation = useMutation<unknown, Error, { id: string }, { prev: Challenge | null }>({
+    mutationKey: mutationKeys.challengeClaim,
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: challengeKey });
+      const prev = queryClient.getQueryData<Challenge | null>(challengeKey) ?? null;
+      queryClient.setQueryData<Challenge | null>(challengeKey, (c) =>
+        c ? { ...c, rewardClaimed: true } : c
+      );
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(challengeKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: challengeKey }),
+  });
+
+  const clearChallengeMutation = useMutation<unknown, Error, { id: string }, { prev: Challenge | null }>({
+    mutationKey: mutationKeys.challengeClear,
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: challengeKey });
+      const prev = queryClient.getQueryData<Challenge | null>(challengeKey) ?? null;
+      queryClient.setQueryData<Challenge | null>(challengeKey, null);
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx) queryClient.setQueryData(challengeKey, ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: challengeKey }),
+  });
+
+  // ---- Imperative API (same shape the screens already use) ----
+
+  const logHabit = useCallback(
+    (id: string) => {
+      const key = todayKey();
+      const habit = getHabits().find((h) => h.id === id);
+      if (!habit) return { justCompleted: false };
+      const count = habit.history[key] ?? 0;
+      if (count >= habit.target) return { justCompleted: false }; // already at target
+      const next = count + 1;
+      setLogMutation.mutate({ habitId: id, day: key, count: next });
+      return { justCompleted: next >= habit.target };
+    },
+    [getHabits, setLogMutation]
+  );
+
+  const unlogHabit = useCallback(
+    (id: string) => {
+      const key = todayKey();
+      const habit = getHabits().find((h) => h.id === id);
+      if (!habit) return;
+      const count = habit.history[key] ?? 0;
+      if (count <= 0) return;
+      setLogMutation.mutate({ habitId: id, day: key, count: count - 1 });
+    },
+    [getHabits, setLogMutation]
+  );
+
+  const addHabit = useCallback<HabitsContextValue['addHabit']>(
+    (name, opts) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      const count = getHabits().length;
+      const type = opts?.type ?? 'binary';
+      addMutation.mutate({
+        tempId: tempId('h'),
+        name: trimmed,
+        emoji: opts?.emoji ?? SUGGESTED_EMOJI[count % SUGGESTED_EMOJI.length],
+        color: opts?.color ?? HABIT_COLORS[count % HABIT_COLORS.length],
+        type,
+        target: type === 'binary' ? 1 : Math.max(2, opts?.target ?? 3),
+      });
+    },
+    [getHabits, addMutation]
+  );
+
+  const deleteHabit = useCallback((id: string) => deleteMutation.mutate({ id }), [deleteMutation]);
+
+  const setHabitTarget = useCallback(
+    (id: string, target: number) => {
+      const habit = getHabits().find((h) => h.id === id);
+      if (!habit) return;
+      const next = habit.type === 'binary' ? 1 : Math.max(2, target);
+      targetMutation.mutate({ id, target: next });
+    },
+    [getHabits, targetMutation]
+  );
+
+  const startChallenge = useCallback(
+    (lengthDays: number) => {
+      startChallengeMutation.mutate({
+        title: `${lengthDays}-Day Starter`,
+        lengthDays,
+        startKey: todayKey(),
+      });
+    },
+    [startChallengeMutation]
+  );
 
   const claimChallengeReward = useCallback(() => {
-    setActiveChallenge((prev) => (prev ? { ...prev, rewardClaimed: true } : prev));
-  }, []);
+    const current = queryClient.getQueryData<Challenge | null>(challengeKey);
+    if (current) claimChallengeMutation.mutate({ id: current.id });
+  }, [challengeKey, claimChallengeMutation]);
 
-  const clearChallenge = useCallback(() => setActiveChallenge(null), []);
+  const clearChallenge = useCallback(() => {
+    const current = queryClient.getQueryData<Challenge | null>(challengeKey);
+    if (current) clearChallengeMutation.mutate({ id: current.id });
+  }, [challengeKey, clearChallengeMutation]);
 
-  const setRemindersEnabled = useCallback((enabled: boolean) => {
-    setRemindersEnabledState(enabled);
-    AsyncStorage.setItem(REMINDERS_KEY, enabled ? 'true' : 'false').catch(() => {});
+  const setRemindersEnabled = useCallback((value: boolean) => {
+    setRemindersEnabledState(value);
+    AsyncStorage.setItem(REMINDERS_KEY, value ? 'true' : 'false').catch(() => {});
   }, []);
 
   const completeOnboarding = useCallback(() => {
@@ -275,18 +360,23 @@ export function HabitsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const resetAll = useCallback(() => {
-    // Cancel scheduled reminders, then drop the persisted keys. The habits
-    // re-seed (and challenge clear) are persisted by their own effects, so we
-    // only remove the keys those effects don't re-write — avoiding a race.
     cancelReminders();
-    AsyncStorage.multiRemove([LEGACY_KEY, REMINDERS_KEY, ONBOARDING_KEY]).catch(() => {});
-    setHabits(seedHabits());
-    setActiveChallenge(null);
+    AsyncStorage.multiRemove([REMINDERS_KEY, ONBOARDING_KEY]).catch(() => {});
     setRemindersEnabledState(false);
     setOnboardingDone(false);
-  }, []);
+    // Wipe + reseed on the server, then refetch.
+    api
+      .resetData()
+      .catch(() => {})
+      .finally(() => {
+        queryClient.invalidateQueries({ queryKey: habitsKey });
+        queryClient.invalidateQueries({ queryKey: challengeKey });
+      });
+  }, [habitsKey, challengeKey]);
 
-  const value = useMemo(
+  const loading = prefsLoading || (enabled && habitsQuery.isLoading);
+
+  const value = useMemo<HabitsContextValue>(
     () => ({
       habits,
       loading,

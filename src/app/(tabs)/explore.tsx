@@ -6,6 +6,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { useAuth } from '@/lib/auth';
 import { currentStreak, lastNDays, longestStreak, weekdayLabel } from '@/lib/date';
 import { completionMap, consistency, dayCompletionRatio, isComplete } from '@/lib/habit';
 import { useHabits, type Habit } from '@/lib/habits-store';
@@ -58,6 +59,7 @@ export default function ProgressScreen() {
           </View>
 
           <ReminderToggle habitCount={habits.length} />
+          <AccountRow />
           <ResetButton />
         </ScrollView>
       </SafeAreaView>
@@ -187,6 +189,25 @@ function ReminderToggle({ habitCount }: { habitCount: number }) {
   );
 }
 
+function AccountRow() {
+  const { user, signOut } = useAuth();
+  return (
+    <ThemedView type="backgroundElement" style={styles.reminderRow}>
+      <View style={styles.reminderText}>
+        <ThemedText style={styles.cardTitle}>Account</ThemedText>
+        <ThemedText themeColor="textSecondary" type="small" numberOfLines={1}>
+          {user?.email ?? 'Signed in'}
+        </ThemedText>
+      </View>
+      <Pressable onPress={signOut} style={({ pressed }) => pressed && { opacity: 0.6 }}>
+        <ThemedText type="link" style={styles.signOut}>
+          Sign out
+        </ThemedText>
+      </Pressable>
+    </ThemedView>
+  );
+}
+
 function ResetButton() {
   const { resetAll } = useHabits();
 
@@ -262,6 +283,7 @@ const styles = StyleSheet.create({
   },
   reminderText: { flex: 1, gap: 2 },
   cardTitle: { fontSize: 16, fontWeight: '600' },
+  signOut: { fontWeight: '600' },
   reset: {
     textAlign: 'center',
     color: '#ff3b30',
